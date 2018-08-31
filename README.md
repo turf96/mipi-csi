@@ -2,16 +2,18 @@
 # Samsung S5P/EXYNOS4 SoC series MIPI-CSI receiver driver
 
 /*
- * Samsung S5P/EXYNOS4 SoC series MIPI-CSI receiver driver
- *
+ * Samsung S5P/EXYNOS4 SoC series MIPI-CSI receiver driver 
  * Copyright (C) 2011 Samsung Electronics Co., Ltd.
+ 
  * Contact: Sylwester Nawrocki, <s.nawrocki@samsung.com>
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
- */
 
+ * This program is free software; you can redistribute it and/or modify
+ 
+ * it under the terms of the GNU General Public License version 2 as
+ 
+ * published by the Free Software Foundation.
+ 
+ */
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -32,16 +34,15 @@
 #include <media/v4l2-subdev.h>
 #include <media/exynos_mc.h>
 #include <plat/mipi_csis.h>
-
 static int debug;
+
 module_param(debug, int, 0644);
 MODULE_PARM_DESC(debug, "Debug level (0-1)");
-
 #define MODULE_NAME			"s5p-mipi-csis"
+
 #define DEFAULT_CSIS_SINK_WIDTH		800
 #define DEFAULT_CSIS_SINK_HEIGHT	480
 #define CLK_NAME_SIZE			20
-
 enum csis_input_entity {
 	CSIS_INPUT_NONE,
 	CSIS_INPUT_SENSOR,
@@ -53,11 +54,13 @@ enum csis_output_entity {
 };
 
 #define CSIS0_MAX_LANES		4		//最大层数
-#define CSIS1_MAX_LANES		2		//2层lane
+
+#define CSIS1_MAX_LANES		1		//1层lane
 /* Register map definition */
 
 /* CSIS global control */
 #define S5PCSIS_CTRL			0x00    //基址的偏移地址
+
 #define S5PCSIS_CTRL_DPDN_DEFAULT	(0 << 31)
 #define S5PCSIS_CTRL_DPDN_SWAP		(1 << 31)
 #define S5PCSIS_CTRL_ALIGN_32BIT	(1 << 20)
@@ -68,29 +71,41 @@ enum csis_output_entity {
 
 /* D-PHY control */
 #define S5PCSIS_DPHYCTRL		0x04  //基址的偏移地址
-#define S5PCSIS_DPHYCTRL_HSS_MASK	(0x1f << 27)	//
-#define S5PCSIS_DPHYCTRL_ENABLE		(0x1f << 0)		//时钟层以及4个数据层开启
+
+#define S5PCSIS_DPHYCTRL_HSS_MASK	(0x1f << 27)	
+#define S5PCSIS_DPHYCTRL_ENABLE		(0x1f << 0)	//时钟层以及4个数据层开启
 
 #define S5PCSIS_CONFIG			0x08   //基址的偏移地址
+
 #define S5PCSIS_CFG_FMT_YCBCR422_8BIT	(0x1e << 2)	//支持yuv422 8bit
-#define S5PCSIS_CFG_FMT_RAW8		(0x2a << 2)		//支持raw8 
-#define S5PCSIS_CFG_FMT_RAW10		(0x2b << 2)		//支持raw10
-#define S5PCSIS_CFG_FMT_RAW12		(0x2c << 2)		//支持raw12
+
+#define S5PCSIS_CFG_FMT_RAW8		(0x2a << 2)	//支持raw8 
+
+#define S5PCSIS_CFG_FMT_RAW10		(0x2b << 2)	//支持raw10
+
+#define S5PCSIS_CFG_FMT_RAW12		(0x2c << 2)	//支持raw12
 
 /* User defined formats, x = 1...4 */
 #define S5PCSIS_CFG_FMT_USER(x)		((0x30 + x - 1) << 2) //用户定义格式
-#define S5PCSIS_CFG_FMT_MASK		(0x3f << 2)		//格式屏蔽，reset value = 0x3f
-#define S5PCSIS_CFG_NR_LANE_MASK	3				//不知道是什么意思
+
+#define S5PCSIS_CFG_FMT_MASK		(0x3f << 2)	//格式屏蔽，reset value = 0x3f
+
+#define S5PCSIS_CFG_NR_LANE_MASK	3		//屏蔽层
 
 /* Interrupt mask. */
 #define S5PCSIS_INTMSK			0x10	 //基址的偏移地址  	
+
 #define S5PCSIS_INTMSK_EN_ALL		0xf000103f	//查手册知开中断
+
 #define S5PCSIS_INTSRC			0x14	//中断源
 
 /* Pixel resolution */
-#define S5PCSIS_RESOL			0x2c     //像素分辨率
+#define S5PCSIS_RESOL			0x2c     //基址的偏移地址
+
 #define CSIS_MAX_PIX_WIDTH		0xffff	 //最大像素宽度
+
 #define CSIS_MAX_PIX_HEIGHT		0xffff	 //最大像素高度
+
 #define CSIS_SRC_CLK			"mout_mpll_user"  //时钟源
 
 enum {
@@ -173,23 +188,23 @@ struct csis_state {
  */
  
 struct csis_pix_format { //CSIS像素格式描述
-	unsigned int pix_width_alignment;
+	unsigned int pix_width_alignment; //像素宽度对齐
 	enum v4l2_mbus_pixelcode code;
 	u32 fmt_reg;
 };
 
 static const struct csis_pix_format s5pcsis_formats[] = {
 	{
-		.code = V4L2_MBUS_FMT_YUYV8_2X8,		//yuv422格式代码，这里改为raw 8
-		.fmt_reg = S5PCSIS_CFG_FMT_YCBCR422_8BIT,	//yuv422格式代码寄存器的值
+		.code = V4L2_MBUS_FMT_RGB565_2X8_BE,	//这里改为raw 8
+		.fmt_reg = S5PCSIS_CFG_FMT_RAW8,	//RAW8格式代码寄存器的值
 	}, {
 		.code = V4L2_MBUS_FMT_JPEG_1X8,		//jpeg
-		.fmt_reg = S5PCSIS_CFG_FMT_USER(1), //选用的颜色格式
+		.fmt_reg = S5PCSIS_CFG_FMT_USER(1), 	// User defined 1: 0x30
 	},
 };
 
 #define s5pcsis_write(__csis, __r, __v) writel(__v, __csis->regs + __r)  //写寄存器
-#define s5pcsis_read(__csis, __r) readl(__csis->regs + __r)				 //读寄存器的值
+#define s5pcsis_read(__csis, __r) readl(__csis->regs + __r)		 //读寄存器的值
 
 static struct csis_state *sd_to_csis_state(struct v4l2_subdev *sdev)  //驱动程序的内部状态数据结构
 {
