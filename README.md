@@ -1,917 +1,1533 @@
-# mipi-csi
-# Samsung S5P/EXYNOS4 SoC series MIPI-CSI receiver driver
 
 /*
- * Samsung S5P/EXYNOS4 SoC series MIPI-CSI receiver driver
+ * ov5645 Camera Driver
  *
- * Copyright (C) 2011 Samsung Electronics Co., Ltd.
- * Contact: Sylwester Nawrocki, <s.nawrocki@samsung.com>
+ * Copyright (C) 2011 Actions Semiconductor Co.,LTD
+ * Wang Xin <wangxin@actions-semi.com>
+ *
+ * Based on ov227x driver
+ *
+ * Copyright (C) 2008 Renesas Solutions Corp.
+ * Kuninori Morimoto <morimoto.kuninori@renesas.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
+ *
+ * fixed by swpark@nexell.co.kr for compatibility with general v4l2 layer (not using soc camera interface)
  */
 
-#include <linux/clk.h>
-#include <linux/delay.h>
-#include <linux/device.h>
-#include <linux/errno.h>
-#include <linux/interrupt.h>
-#include <linux/io.h>
-#include <linux/irq.h>
-#include <linux/kernel.h>
-#include <linux/memory.h>
+#include <linux/init.h>
 #include <linux/module.h>
-#include <linux/platform_device.h>
-#include <linux/pm_runtime.h>
-#include <linux/regulator/consumer.h>
+#include <linux/i2c.h>
 #include <linux/slab.h>
-#include <linux/spinlock.h>
+#include <linux/delay.h>
 #include <linux/videodev2.h>
-#include <linux/videodev2_exynos_media.h>
+#include <linux/v4l2-subdev.h>
+#include <media/v4l2-chip-ident.h>
+#include <media/v4l2-device.h>
 #include <media/v4l2-subdev.h>
-#include <media/exynos_mc.h>
-#include <plat/mipi_csis.h>
+#include <media/v4l2-ctrls.h>
+#include <linux/delay.h>
+#include "ov5645.h"
+#include "./nexell/capture/nxp-capture.h"  //ace 20150721
 
-static int debug;
-module_param(debug, int, 0644);
-MODULE_PARM_DESC(debug, "Debug level (0-1)");
+#define MODULE_NAME "OV5645"
 
-#define MODULE_NAME			"s5p-mipi-csis"
-#define DEFAULT_CSIS_SINK_WIDTH		800
-#define DEFAULT_CSIS_SINK_HEIGHT	480
-#define CLK_NAME_SIZE			20
-
-enum csis_input_entity {
-	CSIS_INPUT_NONE,
-	CSIS_INPUT_SENSOR,
-};
-
-enum csis_output_entity {
-	CSIS_OUTPUT_NONE,
-	CSIS_OUTPUT_FLITE,
-};
-
-#define CSIS0_MAX_LANES		4		//最大层数
-#define CSIS1_MAX_LANES		2		//2层lane
-/* Register map definition */
-
-/* CSIS global control */
-#define S5PCSIS_CTRL			0x00    //基址的偏移地址
-#define S5PCSIS_CTRL_DPDN_DEFAULT	(0 << 31)
-#define S5PCSIS_CTRL_DPDN_SWAP		(1 << 31)
-#define S5PCSIS_CTRL_ALIGN_32BIT	(1 << 20)
-#define S5PCSIS_CTRL_UPDATE_SHADOW	(1 << 16)
-#define S5PCSIS_CTRL_WCLK_EXTCLK	(1 << 8)
-#define S5PCSIS_CTRL_RESET		(1 << 4)
-#define S5PCSIS_CTRL_ENABLE		(1 << 0)
-
-/* D-PHY control */
-#define S5PCSIS_DPHYCTRL		0x04  //基址的偏移地址
-#define S5PCSIS_DPHYCTRL_HSS_MASK	(0x1f << 27)	//
-#define S5PCSIS_DPHYCTRL_ENABLE		(0x1f << 0)		//时钟层以及4个数据层开启
-
-#define S5PCSIS_CONFIG			0x08   //基址的偏移地址
-#define S5PCSIS_CFG_FMT_YCBCR422_8BIT	(0x1e << 2)	//支持yuv422 8bit
-#define S5PCSIS_CFG_FMT_RAW8		(0x2a << 2)		//支持raw8 
-#define S5PCSIS_CFG_FMT_RAW10		(0x2b << 2)		//支持raw10
-#define S5PCSIS_CFG_FMT_RAW12		(0x2c << 2)		//支持raw12
-
-/* User defined formats, x = 1...4 */
-#define S5PCSIS_CFG_FMT_USER(x)		((0x30 + x - 1) << 2) //用户定义格式
-#define S5PCSIS_CFG_FMT_MASK		(0x3f << 2)		//格式屏蔽，reset value = 0x3f
-#define S5PCSIS_CFG_NR_LANE_MASK	3				//不知道是什么意思
-
-/* Interrupt mask. */
-#define S5PCSIS_INTMSK			0x10	 //基址的偏移地址  	
-#define S5PCSIS_INTMSK_EN_ALL		0xf000103f	//查手册知开中断
-#define S5PCSIS_INTSRC			0x14	//中断源
-
-/* Pixel resolution */
-#define S5PCSIS_RESOL			0x2c     //像素分辨率
-#define CSIS_MAX_PIX_WIDTH		0xffff	 //最大像素宽度
-#define CSIS_MAX_PIX_HEIGHT		0xffff	 //最大像素高度
-#define CSIS_SRC_CLK			"mout_mpll_user"  //时钟源
-
-enum {
-	CSIS_CLK_MUX,	//0
-	CSIS_CLK_GATE,	//1
-};
-
-static char *csi_clock_name[] = {
-	[CSIS_CLK_MUX]  = "sclk_gscl_wrap",
-	[CSIS_CLK_GATE] = "gscl_wrap",
-};
-#define NUM_CSIS_CLOCKS	ARRAY_SIZE(csi_clock_name)
-
-enum {
-	ST_POWERED	= 1,
-	ST_STREAMING	= 2,
-	ST_SUSPENDED	= 4,
-};
-
-/**
- * struct csis_state - the driver's internal state data structure
- * @lock: mutex serializing the subdev and power management operations,
- *        protecting @format and @flags members
- * @pads: CSIS pads array
- * @sd: v4l2_subdev associated with CSIS device instance
- * @pdev: CSIS platform device
- * @regs_res: requested I/O register memory resource
- * @regs: mmaped I/O registers memory
- * @clock: CSIS clocks
- * @irq: requested s5p-mipi-csis irq number
- * @flags: the state variable for power and streaming control
- * @csis_fmt: current CSIS pixel format
- * @format: common media bus format for the source and sink pad
- */
- /**
-  * struct csis_state - 驱动程序的内部状态数据结构
-  * @lock：mutex序列化subdev和电源管理操作，保护@format和@flags成员
-  * @pads：CSIS pad数组
-  * @sd：与CSIS设备实例关联的v4l2_subdev
-  * @pdev：CSIS平台设备
-  * @regs_res：请求I / O寄存器内存资源
-  * @regs：mmaped I / O寄存器内存
-  * @clock：CSIS时钟
-  * @irq：请求s5p-mipi-csis irq号码
-  * @flags：电源和流控制的状态变量
-  * @csis_fmt：当前的CSIS像素格式
-  * @format：源和接收器垫的通用媒体总线格式
- */
- 
-struct csis_state {
-	struct mutex lock;
-	struct media_pad pads[CSIS_PADS_NUM];
-	struct exynos_md *mdev;
-	struct v4l2_subdev sd;
-	struct platform_device *pdev;
-	struct resource *regs_res;
-	void __iomem *regs;
-	struct clk *clock[NUM_CSIS_CLOCKS];
-	int irq;
-	struct regulator *supply;
-	u32 flags;
-	const struct csis_pix_format *csis_fmt;
-	struct v4l2_mbus_framefmt format;
-	enum csis_input_entity		input;
-	enum csis_output_entity		output;
-};
-
-/**
- * struct csis_pix_format - CSIS pixel format description
- * @pix_width_alignment: horizontal pixel alignment, width will be
- *                       multiple of 2^pix_width_alignment
- * @code: corresponding media bus code
- * @fmt_reg: S5PCSIS_CONFIG register value
- */
- /**
-  * struct csis_pix_format - CSIS像素格式描述
-  * @pix_width_alignment：水平像素对齐，宽度将是2 ^ pix_width_alignment的倍数
-  * @code：相应的媒体总线代码
-  * @fmt_reg：S5PCSIS_CONFIG寄存器值
- */
- 
-struct csis_pix_format { //CSIS像素格式描述
-	unsigned int pix_width_alignment;
-	enum v4l2_mbus_pixelcode code;
-	u32 fmt_reg;
-};
-
-static const struct csis_pix_format s5pcsis_formats[] = {
-	{
-		.code = V4L2_MBUS_FMT_YUYV8_2X8,		//yuv422格式代码，这里改为raw 8
-		.fmt_reg = S5PCSIS_CFG_FMT_YCBCR422_8BIT,	//yuv422格式代码寄存器的值
-	}, {
-		.code = V4L2_MBUS_FMT_JPEG_1X8,		//jpeg
-		.fmt_reg = S5PCSIS_CFG_FMT_USER(1), //选用的颜色格式
-	},
-};
-
-#define s5pcsis_write(__csis, __r, __v) writel(__v, __csis->regs + __r)  //写寄存器
-#define s5pcsis_read(__csis, __r) readl(__csis->regs + __r)				 //读寄存器的值
-
-static struct csis_state *sd_to_csis_state(struct v4l2_subdev *sdev)  //驱动程序的内部状态数据结构
-{
-	return container_of(sdev, struct csis_state, sd);
-}
-
-static const struct csis_pix_format *find_csis_format(   //寻找像素格式
-	struct v4l2_mbus_framefmt *mf) 
-{
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(s5pcsis_formats); i++)  //s5pcsis_formats 上面已有定义
-		if (mf->code == s5pcsis_formats[i].code)
-			return &s5pcsis_formats[i];
-	return NULL;
-}
-
-static void s5pcsis_enable_interrupts(struct csis_state *state, bool on)  //开启中断
-{
-	u32 val = s5pcsis_read(state, S5PCSIS_INTMSK);
-
-	val = on ? val | S5PCSIS_INTMSK_EN_ALL :
-		   val & ~S5PCSIS_INTMSK_EN_ALL;
-	s5pcsis_write(state, S5PCSIS_INTMSK, val);
-}
-
-static void s5pcsis_reset(struct csis_state *state)  //csi 复位
-{
-	u32 val = s5pcsis_read(state, S5PCSIS_CTRL);
-
-	s5pcsis_write(state, S5PCSIS_CTRL, val | S5PCSIS_CTRL_RESET);
-	udelay(10);
-}
-
-static void s5pcsis_system_enable(struct csis_state *state, int on)
-{
-	u32 val;
-
-	val = s5pcsis_read(state, S5PCSIS_CTRL);
-	if (on)
-		val |= S5PCSIS_CTRL_ENABLE;		//mipi csi2 system enable
-	else
-		val &= ~S5PCSIS_CTRL_ENABLE;
-	s5pcsis_write(state, S5PCSIS_CTRL, val);
-
-	val = s5pcsis_read(state, S5PCSIS_DPHYCTRL);
-	if (on)
-		val |= S5PCSIS_DPHYCTRL_ENABLE;		//开启DPHY控制通道
-	else
-		val &= ~S5PCSIS_DPHYCTRL_ENABLE;
-	s5pcsis_write(state, S5PCSIS_DPHYCTRL, val);
-}
-
-/* Called with the state.lock mutex held */
-static void __s5pcsis_set_format(struct csis_state *state)  //设置格式
-{
-	struct v4l2_mbus_framefmt *mf = &state->format;
-	u32 val;
-
-	v4l2_dbg(1, debug, &state->sd, "fmt: %d, %d x %d\n",
-		 mf->code, mf->width, mf->height);
-
-	/* Color format */	//设置颜色格式
-	val = s5pcsis_read(state, S5PCSIS_CONFIG);
-	val = (val & ~S5PCSIS_CFG_FMT_MASK) | state->csis_fmt->fmt_reg;
-	s5pcsis_write(state, S5PCSIS_CONFIG, val);
-
-	/* Pixel resolution */		//像素分辨率
-	val = (mf->width << 16) | mf->height;
-	s5pcsis_write(state, S5PCSIS_RESOL, val);
-}
-
-static void s5pcsis_set_hsync_settle(struct csis_state *state, int settle) //设置行同步信号
-{
-	u32 val = s5pcsis_read(state, S5PCSIS_DPHYCTRL);
-
-	val = (val & ~S5PCSIS_DPHYCTRL_HSS_MASK) | (settle << 27);
-	s5pcsis_write(state, S5PCSIS_DPHYCTRL, val);
-}
-
-static void s5pcsis_set_params(struct csis_state *state)  //参数设置
-{
-	struct s5p_platform_mipi_csis *pdata = state->pdev->dev.platform_data;  //平台数据
-	u32 val;
-
-	val = s5pcsis_read(state, S5PCSIS_CONFIG);
-	val = (val & ~S5PCSIS_CFG_NR_LANE_MASK) | (pdata->lanes - 1);
-	s5pcsis_write(state, S5PCSIS_CONFIG, val);
-
-	__s5pcsis_set_format(state);		//设置格式（颜色、分辨率）
-	s5pcsis_set_hsync_settle(state, pdata->hs_settle); //设置水平同步信号
-
-	val = s5pcsis_read(state, S5PCSIS_CTRL);
-	if (pdata->alignment == 32)
-		val |= S5PCSIS_CTRL_ALIGN_32BIT;
-	else /* 24-bits */
-		val &= ~S5PCSIS_CTRL_ALIGN_32BIT;
-	/* using external clock. */  //使用外部时钟源
-	val |= S5PCSIS_CTRL_WCLK_EXTCLK;
-	s5pcsis_write(state, S5PCSIS_CTRL, val);
-
-	/* Update the shadow register. */
-	val = s5pcsis_read(state, S5PCSIS_CTRL);
-	s5pcsis_write(state, S5PCSIS_CTRL, val | S5PCSIS_CTRL_UPDATE_SHADOW);
-}
-
-static void s5pcsis_clk_put(struct csis_state *state)
-{
-	int i;
-
-	for (i = 0; i < NUM_CSIS_CLOCKS; i++)
-		if (!IS_ERR_OR_NULL(state->clock[i]))
-			clk_put(state->clock[i]);
-}
-
-static int s5pcsis_clk_get(struct csis_state *state)
-{
-	struct device *dev = &state->pdev->dev;
-	int i;
-	char clk_name[CLK_NAME_SIZE];
-
-	for (i = 0; i < NUM_CSIS_CLOCKS; i++) {
-		snprintf(clk_name, sizeof(clk_name), "%s%d",
-			 csi_clock_name[i], state->pdev->id);
-		state->clock[i] = clk_get(dev, clk_name);
-		if (IS_ERR(state->clock[i])) {
-			s5pcsis_clk_put(state);
-			dev_err(dev, "failed to get clock: %s\n",
-				csi_clock_name[i]);
-			return -ENXIO;
-		}
-	}
-	return 0;
-}
-
-static int s5pcsis_resume(struct device *dev);
-static int s5pcsis_s_power(struct v4l2_subdev *sd, int on)
-{
-	struct csis_state *state = sd_to_csis_state(sd);
-	struct device *dev = &state->pdev->dev;
-
-	if (on) {
-#ifndef CONFIG_PM_RUNTIME
-		return s5pcsis_resume(dev);
+#if 1
+#define OV5645_DBG(fmt, arg...) printk(KERN_INFO "ov5645: " fmt, ## arg)
 #else
-		return pm_runtime_get_sync(dev);
+#define OV5645_DBG(fmt, arg...)
 #endif
+                                                          
+#if 1
+#define OV5645_ERR(fmt, arg...) printk(KERN_ERR "ov5645: " fmt, ## arg)
+#else
+#define OV5645_ERR(fmt, arg...)
+#endif
+
+#define PID                 0x02 /* Product ID Number  *///caichsh
+#define OV5645              0x53
+#define OUTTO_SENSO_CLOCK   24000000
+#define NUM_CTRLS           11
+#define V4L2_IDENT_OV5645   64188
+
+/* private ctrls */
+#define V4L2_CID_SCENE_EXPOSURE         (V4L2_CTRL_CLASS_CAMERA | 0x1001)
+#define V4L2_CID_PRIVATE_PREV_CAPT      (V4L2_CTRL_CLASS_CAMERA | 0x1002)
+
+#if 0
+enum {
+    V4L2_WHITE_BALANCE_INCANDESCENT = 0,
+    V4L2_WHITE_BALANCE_FLUORESCENT,
+    V4L2_WHITE_BALANCE_DAYLIGHT,
+    V4L2_WHITE_BALANCE_CLOUDY_DAYLIGHT,
+    V4L2_WHITE_BALANCE_TUNGSTEN
+};
+#else
+enum {
+    V4L2_WHITE_BALANCE_INCANDESCENT = 0,
+    /*V4L2_WHITE_BALANCE_FLUORESCENT,*/
+    V4L2_WHITE_BALANCE_DAYLIGHT,
+    V4L2_WHITE_BALANCE_CLOUDY_DAYLIGHT,
+    /*V4L2_WHITE_BALANCE_TUNGSTEN*/
+};
+#endif
+
+static void ov5640_auto_focus(struct work_struct *work);
+static DECLARE_DELAYED_WORK(focus_work, ov5640_auto_focus); 
+
+static int ov5645_video_probe(struct i2c_client *client);
+/****************************************************************************************
+ * predefined reg values
+ */
+//#define ARRAY_END { 0xffff, 0xff }
+//#define DELAYMARKER { 0xfffe, 0xff }
+
+
+static struct regval_list ov5645_fmt_yuv422_yuyv[] =
+{
+    ARRAY_END,
+};
+
+static struct regval_list ov5645_fmt_yuv422_yvyu[] =
+{
+    ARRAY_END,
+};
+
+static struct regval_list ov5645_fmt_yuv422_vyuy[] =
+{
+    ARRAY_END,
+};
+
+static struct regval_list ov5645_fmt_yuv422_uyvy[] =
+{
+    ARRAY_END,
+};
+
+
+/*
+ *AWB
+ */
+static const struct regval_list ov5645_awb_regs_enable[] =
+{
+    ARRAY_END,
+};
+
+static const struct regval_list ov5645_awb_regs_diable[] =
+{
+    ARRAY_END,
+};
+
+static struct regval_list ov5645_wb_cloud_regs[] =
+{
+    ARRAY_END,
+};
+
+static struct regval_list ov5645_wb_daylight_regs[] =
+{
+    ARRAY_END,
+};
+
+static struct regval_list ov5645_wb_incandescence_regs[] =
+{
+    ARRAY_END,
+};
+
+static struct regval_list ov5645_wb_fluorescent_regs[] =
+{
+    ARRAY_END,
+};
+
+static struct regval_list ov5645_wb_tungsten_regs[] =
+{
+    ARRAY_END,
+};
+
+static struct regval_list ov5645_colorfx_none_regs[] =
+{
+    ARRAY_END,
+};
+
+static struct regval_list ov5645_colorfx_bw_regs[] =
+{
+    ARRAY_END,
+};
+
+static struct regval_list ov5645_colorfx_sepia_regs[] =
+{
+    ARRAY_END,
+};
+
+static struct regval_list ov5645_colorfx_negative_regs[] =
+{
+    ARRAY_END,
+};
+
+static struct regval_list ov5645_whitebance_auto[] __attribute__((unused)) =
+{
+	ARRAY_END,
+};
+
+static struct regval_list ov5645_whitebance_cloudy[] __attribute__((unused)) =
+{
+	ARRAY_END,
+};
+
+static  struct regval_list ov5645_whitebance_sunny[] __attribute__((unused)) =
+{
+	ARRAY_END,
+};
+
+static  struct regval_list ov5645_whitebance_fluorescent[] __attribute__((unused)) =
+{
+	ARRAY_END,
+
+};
+static  struct regval_list ov5645_whitebance_incandescent[] __attribute__((unused)) =
+{
+	ARRAY_END,
+};
+
+
+static  struct regval_list ov5645_effect_normal[] __attribute__((unused)) =
+{
+    ARRAY_END,
+};
+
+static  struct regval_list ov5645_effect_white_black[] __attribute__((unused)) =
+{
+  ARRAY_END,
+};
+
+/* Effect */
+static  struct regval_list ov5645_effect_negative[] __attribute__((unused)) =
+{
+	ARRAY_END,
+};
+/*žŽ¹ÅÐ§¹û*/
+static  struct regval_list ov5645_effect_antique[] __attribute__((unused)) =
+{
+	ARRAY_END,
+};
+
+/* Scene */
+static  struct regval_list ov5645_scene_auto[] __attribute__((unused)) =
+{
+	ARRAY_END,
+};
+
+static  struct regval_list ov5645_scene_night[] __attribute__((unused)) =
+{
+	ARRAY_END,
+};
+
+
+/****************************************************************************************
+ * structures
+ */
+struct ov5645_win_size {
+    char                        *name;
+    __u32                       width;
+    __u32                       height;
+    __u32                       exposure_line_width;
+    __u32                       capture_maximum_shutter;
+    const struct regval_list    *win_regs;
+    const struct regval_list    *lsc_regs;
+    unsigned int                *frame_rate_array;
+};
+
+typedef struct {
+    unsigned int max_shutter;
+    unsigned int shutter;
+    unsigned int gain;
+    unsigned int dummy_line;
+    unsigned int dummy_pixel;
+    unsigned int extra_line;
+} exposure_param_t;
+
+enum prev_capt {
+    PREVIEW_MODE = 0,
+    CAPTURE_MODE
+};
+
+struct ov5645_priv {
+    struct v4l2_subdev                  subdev;
+    struct media_pad                    pad;
+    struct v4l2_ctrl_handler            hdl;
+    const struct ov5645_color_format    *cfmt;
+    const struct ov5645_win_size        *win;
+    int                                 model;
+    bool                                initialized;
+bool autofocused;	//hdc 20151123
+
+    /**
+     * ctrls
+    */
+    /* standard */
+    struct v4l2_ctrl *brightness;
+    struct v4l2_ctrl *contrast;
+    struct v4l2_ctrl *auto_white_balance;
+    struct v4l2_ctrl *exposure;
+    struct v4l2_ctrl *gain;
+    struct v4l2_ctrl *hflip;
+    struct v4l2_ctrl *white_balance_temperature;
+    /* menu */
+    struct v4l2_ctrl *colorfx;
+    struct v4l2_ctrl *exposure_auto;
+    /* custom */
+    struct v4l2_ctrl *scene_exposure;
+    struct v4l2_ctrl *prev_capt;
+
+    struct v4l2_rect rect; /* Sensor window */
+    struct v4l2_fract timeperframe;
+    enum prev_capt prev_capt_mode;
+    exposure_param_t preview_exposure_param;
+    exposure_param_t capture_exposure_param;
+};
+
+struct ov5645_color_format {
+    enum v4l2_mbus_pixelcode code;
+    enum v4l2_colorspace colorspace;
+};
+
+/****************************************************************************************
+ * tables
+ */
+static const struct ov5645_color_format ov5645_cfmts[] = {
+    {
+        .code		= V4L2_MBUS_FMT_YUYV8_2X8,
+        .colorspace	= V4L2_COLORSPACE_JPEG,
+    },
+    {
+        .code		= V4L2_MBUS_FMT_UYVY8_2X8,
+        .colorspace	= V4L2_COLORSPACE_JPEG,
+    },
+    {
+        .code		= V4L2_MBUS_FMT_YVYU8_2X8,
+        .colorspace	= V4L2_COLORSPACE_JPEG,
+    },
+    {
+        .code		= V4L2_MBUS_FMT_VYUY8_2X8,
+        .colorspace	= V4L2_COLORSPACE_JPEG,
+    },
+};
+
+/*
+ * window size list
+ */
+#define VGA_WIDTH           640
+#define VGA_HEIGHT          480
+#define UXGA_WIDTH          1600
+#define UXGA_HEIGHT         1200
+#define SVGA_WIDTH          1280
+#define SVGA_HEIGHT         960
+#define OV5645_MAX_WIDTH    UXGA_WIDTH
+#define OV5645_MAX_HEIGHT   UXGA_HEIGHT
+#define AHEAD_LINE_NUM		15    //10ÐÐ = 50ŽÎÑ­»·(OV5645)
+#define DROP_NUM_CAPTURE			0
+#define DROP_NUM_PREVIEW			0
+
+static unsigned int frame_rate_svga[] = {20,};
+static unsigned int frame_rate_uxga[] = {20,30,};
+
+/* 2593x1944 */
+static const struct ov5645_win_size OV5645_win_2592x1944 = {
+    .name     = "2592x1944",
+    .width    = 2592,
+    .height   = 1944,
+    .win_regs = OV5645_res_2592x1944,
+    .frame_rate_array = frame_rate_svga,
+};
+
+/* 1920x1080 */
+static const struct ov5645_win_size OV5645_win_1920x1080 = {
+    .name     = "1920x1080",
+    .width    = 1920,
+    .height   = 1080,
+    .win_regs = OV5645_res_1920x1080,
+    .frame_rate_array = frame_rate_svga,
+};
+
+/* 1280x960 */
+static const struct ov5645_win_size OV5645_win_1280x960 = {
+    .name     = "SVGA",
+    .width    = SVGA_WIDTH,
+    .height   = SVGA_HEIGHT,
+    .win_regs = OV5645_res_1280x960,
+    .frame_rate_array = frame_rate_svga,
+};
+
+/* 1280x720 */
+static const struct ov5645_win_size OV5645_win_1280x720 = {
+    .name     = "1280x720",
+    .width    = 1280,
+    .height   = 720,
+    .win_regs = OV5645_res_1280x720,
+    .frame_rate_array = frame_rate_svga,
+};
+
+/* 1600X1200 */
+static const struct ov5645_win_size OV5645_win_1600x1200 = {
+    .name     = "UXGA",
+    .width    = UXGA_WIDTH,
+    .height   = UXGA_HEIGHT,
+    .win_regs = OV5645_res_1600x1200,
+    .frame_rate_array = frame_rate_uxga,
+};
+
+/* 640x480 */
+static const struct ov5645_win_size OV5645_win_640x480 = {
+    .name     = "VGA",
+    .width    = 640,
+    .height   = 480,
+    .win_regs = OV5645_res_640x480,
+    .frame_rate_array = frame_rate_uxga,
+};
+
+static const struct ov5645_win_size *ov5645_win[] = {
+    &OV5645_win_2592x1944,
+    &OV5645_win_1920x1080,
+    &OV5645_win_1280x960,
+    &OV5645_win_1280x720,
+    &OV5645_win_1600x1200,
+    &OV5645_win_640x480,
+};
+
+/****************************************************************************************
+ * general functions
+ */
+static inline struct ov5645_priv *to_priv(struct v4l2_subdev *subdev)
+{
+    return container_of(subdev, struct ov5645_priv, subdev);
+}
+
+static inline struct v4l2_subdev *ctrl_to_sd(struct v4l2_ctrl *ctrl)
+{
+    return &container_of(ctrl->handler, struct ov5645_priv, hdl)->subdev;
+}
+
+static int reg_read_16(struct i2c_client *client, u16 reg, u8 *val)
+{
+	int ret;
+	/* We have 16-bit i2c addresses - care for endianess */
+	unsigned char data[2] = { reg >> 8, reg & 0xff };
+
+	ret = i2c_master_send(client, data, 2);
+	if (ret < 2) {
+		dev_err(&client->dev, "%s: i2c read send error,addr= %x , reg: %x\n",
+			__func__, client->addr,reg);
+		return ret < 0 ? ret : -EIO;
 	}
 
-	return pm_runtime_put_sync(dev);
+	ret = i2c_master_recv(client, val, 1);
+	if (ret < 1) {
+		dev_err(&client->dev, "%s: i2c read recv error, reg: %x\n",
+				__func__, reg);
+		return ret < 0 ? ret : -EIO;
+	}
+	return 0;
 }
 
-static void s5pcsis_start_stream(struct csis_state *state)  //开始流
+static int reg_write_16(struct i2c_client *client, u16 reg, u8 val)
 {
-	s5pcsis_reset(state);
-	s5pcsis_set_params(state);
-	s5pcsis_system_enable(state, true);
-	s5pcsis_enable_interrupts(state, true);
+	int ret;
+	unsigned char data[3] = { reg >> 8, reg & 0xff, val };
+
+	ret = i2c_master_send(client, data, 3);
+	if (ret < 3) {
+		dev_err(&client->dev, "%s: i2c write error, reg: %x\n",	__func__, reg);
+		return ret < 0 ? ret : -EIO;
+	}
+	return 0;
 }
-
-static void s5pcsis_stop_stream(struct csis_state *state)	//停止流
+static int reg_write_array(struct i2c_client *client,
+				struct regval_list  *vals)
 {
-	s5pcsis_enable_interrupts(state, false);
-	s5pcsis_system_enable(state, false);
-}
-
-/* v4l2_subdev operations */  //v4l2 子设备操作
-static int s5pcsis_s_stream(struct v4l2_subdev *sd, int enable)
-{
-	struct csis_state *state = sd_to_csis_state(sd);
-	int ret = 0;
-
-	v4l2_dbg(1, debug, sd, "%s: %d, state: 0x%x\n",
-		 __func__, enable, state->flags);
-
-	if (enable) {
-		ret = pm_runtime_get_sync(&state->pdev->dev);
-		if (ret && ret != 1)
+	while(vals->reg != ARRAY_END_ADDR){
+		int ret = reg_write_16(client, vals->reg, vals->value);
+		if (ret < 0)
 			return ret;
+		#if 0 // for test write sensor reg
+			//mdelay(50);
+			msleep(10);
+			uint8_t value = -1;;
+
+			ret = reg_read_16(client, vals->reg, &value);
+			if(vals->value != (value & 0xff))
+				printk("[addr]%x, [R] reg[0x:%x] [W]:value:[0x%x]  [R]value[:0x%x]\n",client->addr, vals->reg,vals->value,value);
+		#endif
+		if(vals->delayms> 0)
+			msleep(vals->delayms);
+		vals++;
 	}
-	mutex_lock(&state->lock);
-	if (enable) {
-		if (state->flags & ST_SUSPENDED) {
-			ret = -EBUSY;
-			goto unlock;
+	return 0;
+}
+
+int ov5645_read(struct v4l2_subdev *sd, unsigned short reg,
+		unsigned char *value)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(sd);
+	unsigned char buf[2] = {reg >> 8, reg & 0xff};
+	struct i2c_msg msg[2] = {
+		[0] = {
+			.addr	= client->addr,
+			.flags	= 0,
+			.len	= 2,
+			.buf	= buf,
+		},
+		[1] = {
+			.addr	= client->addr,
+			.flags	= I2C_M_RD,
+			.len	= 1,
+			.buf	= value,
 		}
-		s5pcsis_start_stream(state);
-		state->flags |= ST_STREAMING;
-	} else {
-		s5pcsis_stop_stream(state);
-		state->flags &= ~ST_STREAMING;
-	}
-unlock:
-	mutex_unlock(&state->lock);
-	if (!enable)
-		pm_runtime_put(&state->pdev->dev);
-
-	return ret == 1 ? 0 : ret;
-}
-
-static int s5pcsis_enum_mbus_code(struct v4l2_subdev *sd,  //枚举视频代码
-				  struct v4l2_subdev_fh *fh,
-				  struct v4l2_subdev_mbus_code_enum *code)
-{
-	if (code->index >= ARRAY_SIZE(s5pcsis_formats))  //像素格式
-		return -EINVAL;
-
-	code->code = s5pcsis_formats[code->index].code;
-	return 0;
-}
-
-static struct csis_pix_format const *s5pcsis_try_format(   //设置格式
-	struct v4l2_mbus_framefmt *mf)
-{
-	struct csis_pix_format const *csis_fmt;
-
-	csis_fmt = find_csis_format(mf);
-	if (csis_fmt == NULL)
-		csis_fmt = &s5pcsis_formats[0];
-
-	mf->code = csis_fmt->code;
-	v4l_bound_align_image(&mf->width, 1, CSIS_MAX_PIX_WIDTH,
-			      csis_fmt->pix_width_alignment,
-			      &mf->height, 1, CSIS_MAX_PIX_HEIGHT, 1,
-			      0);
-	return csis_fmt;
-}
-
-static struct v4l2_mbus_framefmt *__s5pcsis_get_format(  //设置帧格式
-		struct csis_state *state, struct v4l2_subdev_fh *fh,
-		u32 pad, enum v4l2_subdev_format_whence which)
-{
-	if (which == V4L2_SUBDEV_FORMAT_TRY)
-		return fh ? v4l2_subdev_get_try_format(fh, pad) : NULL;
-
-	return &state->format;
-}
-
-static int s5pcsis_set_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh,
-			   struct v4l2_subdev_format *fmt)
-{
-	struct csis_state *state = sd_to_csis_state(sd);
-	struct csis_pix_format const *csis_fmt;
-	struct v4l2_mbus_framefmt *mf;
-
-	mf = __s5pcsis_get_format(state, fh, fmt->pad, fmt->which);
-
-	if (fmt->pad == CSIS_PAD_SOURCE) {
-		if (mf) {
-			mutex_lock(&state->lock);
-			fmt->format = *mf;
-			mutex_unlock(&state->lock);
-		}
-		return 0;
-	}
-	csis_fmt = s5pcsis_try_format(&fmt->format);
-	if (mf) {
-		mutex_lock(&state->lock);
-		*mf = fmt->format;
-		if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE)
-			state->csis_fmt = csis_fmt;
-		mutex_unlock(&state->lock);
-	}
-	return 0;
-}
-
-static int s5pcsis_get_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh,
-			   struct v4l2_subdev_format *fmt)
-{
-	struct csis_state *state = sd_to_csis_state(sd);
-	struct v4l2_mbus_framefmt *mf;
-
-	if (fmt->pad != CSIS_PAD_SOURCE && fmt->pad != CSIS_PAD_SINK)
-		return -EINVAL;
-
-	mf = __s5pcsis_get_format(state, fh, fmt->pad, fmt->which);
-	if (!mf)
-		return -EINVAL;
-
-	mutex_lock(&state->lock);
-	fmt->format = *mf;
-	mutex_unlock(&state->lock);
-
-	return 0;
-}
-
-static struct v4l2_subdev_core_ops s5pcsis_core_ops = {
-	.s_power = s5pcsis_s_power,
-};
-
-static struct v4l2_subdev_pad_ops s5pcsis_pad_ops = {
-	.enum_mbus_code = s5pcsis_enum_mbus_code,
-	.get_fmt = s5pcsis_get_fmt,
-	.set_fmt = s5pcsis_set_fmt,
-};
-
-static struct v4l2_subdev_video_ops s5pcsis_video_ops = {
-	.s_stream = s5pcsis_s_stream,
-};
-
-static struct v4l2_subdev_ops s5pcsis_subdev_ops = {
-	.core = &s5pcsis_core_ops,
-	.pad = &s5pcsis_pad_ops,
-	.video = &s5pcsis_video_ops,
-};
-
-static int s5pcsis_init_formats(struct v4l2_subdev *sd,
-				struct v4l2_subdev_fh *fh)
-{
-	struct v4l2_subdev_format format;
-
-	memset(&format, 0, sizeof(format));
-	format.pad = CSIS_PAD_SINK;
-	format.which = fh ? V4L2_SUBDEV_FORMAT_TRY : V4L2_SUBDEV_FORMAT_ACTIVE;
-	format.format.code = s5pcsis_formats[0].code;
-	format.format.width = DEFAULT_CSIS_SINK_WIDTH;
-	format.format.height = DEFAULT_CSIS_SINK_HEIGHT;
-	s5pcsis_set_fmt(sd, fh, &format);
-
-	return 0;
-}
-
-static int s5pcsis_subdev_close(struct v4l2_subdev *sd,
-				struct v4l2_subdev_fh *fh)
-{
-	v4l2_info(sd, "%s\n", __func__);
-	return 0;
-}
-
-static int s5pcsis_subdev_registered(struct v4l2_subdev *sd)
-{
-	v4l2_dbg(1, debug, sd, "%s\n", __func__);
-	return 0;
-}
-
-static void s5pcsis_subdev_unregistered(struct v4l2_subdev *sd)
-{
-	v4l2_dbg(1, debug, sd, "%s\n", __func__);
-}
-
-static const struct v4l2_subdev_internal_ops s5pcsis_v4l2_internal_ops = {
-	.open = s5pcsis_init_formats,
-	.close = s5pcsis_subdev_close,
-	.registered = s5pcsis_subdev_registered,
-	.unregistered = s5pcsis_subdev_unregistered,
-};
-
-static int s5pcsis_link_setup(struct media_entity *entity,
-			      const struct media_pad *local,
-			      const struct media_pad *remote, u32 flags)
-{
-	struct v4l2_subdev *sd = media_entity_to_v4l2_subdev(entity);
-	struct csis_state *state = sd_to_csis_state(sd);
-
-	switch (local->index | media_entity_type(remote->entity)) {
-	case CSIS_PAD_SINK | MEDIA_ENT_T_V4L2_SUBDEV:
-		if (flags & MEDIA_LNK_FL_ENABLED) {
-			v4l2_info(sd, "%s : sink link enabled\n", __func__);
-			state->input = CSIS_INPUT_SENSOR;
-		} else {
-			v4l2_info(sd, "%s : sink link disabled\n", __func__);
-			state->input = CSIS_INPUT_NONE;
-		}
-		break;
-
-	case CSIS_PAD_SOURCE | MEDIA_ENT_T_V4L2_SUBDEV:
-		if (flags & MEDIA_LNK_FL_ENABLED) {
-			v4l2_info(sd, "%s : source link enabled\n", __func__);
-			state->output = CSIS_OUTPUT_FLITE;
-		} else {
-			v4l2_info(sd, "%s : source link disabled\n", __func__);
-			state->output = CSIS_OUTPUT_NONE;
-		}
-		break;
-
-	default:
-		v4l2_err(sd, "%s : ERR link\n", __func__);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static const struct media_entity_operations s5pcsis_media_ops = {
-	.link_setup = s5pcsis_link_setup,
-};
-
-static irqreturn_t s5pcsis_irq_handler(int irq, void *dev_id)
-{
-	struct csis_state *state = dev_id;
-	u32 val;
-
-	/* Just clear the interrupt pending bits. */
-	val = s5pcsis_read(state, S5PCSIS_INTSRC);
-	s5pcsis_write(state, S5PCSIS_INTSRC, val);
-
-	v4l2_info(&state->sd, "%s : error : 0x%x\n", __func__, val);
-
-	return IRQ_HANDLED;
-}
-
-static int csis_get_md_callback(struct device *dev, void *p)
-{
-	struct exynos_md **md_list = p;
-	struct exynos_md *md = NULL;
-
-	md = dev_get_drvdata(dev);
-
-	if (md)
-		*(md_list + md->id) = md;
-
-	return 0; /* non-zero value stops iteration */
-}
-
-static struct exynos_md *csis_get_capture_md(enum mdev_node node)
-{
-	struct device_driver *drv;
-	struct exynos_md *md[MDEV_MAX_NUM] = {NULL,};
+	};
 	int ret;
 
-	drv = driver_find(MDEV_MODULE_NAME, &platform_bus_type);
-	if (!drv)
-		return ERR_PTR(-ENODEV);
+	ret = i2c_transfer(client->adapter, msg, 2);
+	if (ret > 0)
+		ret = 0;
 
-	ret = driver_for_each_device(drv, NULL, &md[0],
-				     csis_get_md_callback);
-
-	return ret ? NULL : md[node];
-
-}
-
-static int __devinit s5pcsis_probe(struct platform_device *pdev)
-{
-	struct s5p_platform_mipi_csis *pdata;
-	struct resource *mem_res;
-	struct resource *regs_res;
-	struct csis_state *state;
-	int ret = -ENOMEM;
-
-	state = kzalloc(sizeof(*state), GFP_KERNEL);
-	if (!state)
-		return -ENOMEM;
-
-	mutex_init(&state->lock);
-	state->pdev = pdev;
-
-	pdata = pdev->dev.platform_data;
-	if (pdata == NULL || pdata->phy_enable == NULL) {
-		dev_err(&pdev->dev, "Platform data not fully specified\n");
-		goto e_free;
-	}
-
-	if ((pdev->id == 1 && pdata->lanes > CSIS1_MAX_LANES) ||
-	    pdata->lanes > CSIS0_MAX_LANES) {
-		ret = -EINVAL;
-		dev_err(&pdev->dev, "Unsupported number of data lanes: %d\n",
-			pdata->lanes);
-		goto e_free;
-	}
-
-	mem_res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (!mem_res) {
-		dev_err(&pdev->dev, "Failed to get IO memory region\n");
-		goto e_free;
-	}
-
-	regs_res = request_mem_region(mem_res->start, resource_size(mem_res),
-				      pdev->name);
-	if (!regs_res) {
-		dev_err(&pdev->dev, "Failed to request IO memory region\n");
-		goto e_free;
-	}
-	state->regs_res = regs_res;
-
-	state->regs = ioremap(mem_res->start, resource_size(mem_res));
-	if (!state->regs) {
-		dev_err(&pdev->dev, "Failed to remap IO region\n");
-		goto e_reqmem;
-	}
-
-	ret = s5pcsis_clk_get(state);
-	if (ret)
-		goto e_unmap;
-
-	clk_enable(state->clock[CSIS_CLK_MUX]);
-	if (pdata->clk_rate) {
-		struct clk *srclk;
-		srclk = clk_get(&state->pdev->dev, CSIS_SRC_CLK);
-		if (IS_ERR_OR_NULL(srclk)) {
-			dev_err(&state->pdev->dev, "failed to get csis src clk\n");
-			goto e_unmap;
-		}
-		clk_set_parent(state->clock[CSIS_CLK_MUX], srclk);
-		clk_put(srclk);
-		clk_set_rate(state->clock[CSIS_CLK_MUX], pdata->clk_rate);
-	} else {
-		dev_WARN(&pdev->dev, "No clock frequency specified!\n");
-	}
-
-	state->irq = platform_get_irq(pdev, 0);
-	if (state->irq < 0) {
-		ret = state->irq;
-		dev_err(&pdev->dev, "Failed to get irq\n");
-		goto e_clkput;
-	}
-
-	if (!pdata->fixed_phy_vdd) {
-		state->supply = regulator_get(&pdev->dev, "mipi_csi");
-		if (IS_ERR(state->supply)) {
-			ret = PTR_ERR(state->supply);
-			state->supply = NULL;
-			goto e_clkput;
-		}
-	}
-
-	ret = request_irq(state->irq, s5pcsis_irq_handler, 0,
-			  dev_name(&pdev->dev), state);
-	if (ret) {
-		dev_err(&pdev->dev, "request_irq failed\n");
-		goto e_regput;
-	}
-
-	v4l2_subdev_init(&state->sd, &s5pcsis_subdev_ops);
-	state->sd.owner = THIS_MODULE;
-	state->sd.flags = V4L2_SUBDEV_FL_HAS_DEVNODE;
-	snprintf(state->sd.name, sizeof(state->sd.name), "%s.%d\n",
-					MODULE_NAME, pdev->id);
-
-	state->pads[CSIS_PAD_SINK].flags = MEDIA_PAD_FL_SINK;
-	state->pads[CSIS_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
-	ret = media_entity_init(&state->sd.entity,
-				CSIS_PADS_NUM, state->pads, 0);
-	if (ret < 0)
-		goto e_irqfree;
-
-	s5pcsis_init_formats(&state->sd, NULL);
-
-	state->sd.internal_ops = &s5pcsis_v4l2_internal_ops;
-	state->sd.entity.ops = &s5pcsis_media_ops;
-
-	state->mdev = csis_get_capture_md(MDEV_CAPTURE);
-	if (IS_ERR_OR_NULL(state->mdev))
-		goto e_irqfree;
-
-	state->mdev->csis_sd[pdev->id] = &state->sd;
-	state->sd.grp_id = CSIS_GRP_ID;
-	ret = v4l2_device_register_subdev(&state->mdev->v4l2_dev, &state->sd);
-	if (ret)
-		goto e_irqfree;
-	/* This allows to retrieve the platform device id by the host driver */
-	v4l2_set_subdevdata(&state->sd, pdev);
-
-	/* .. and a pointer to the subdev. */
-	platform_set_drvdata(pdev, &state->sd);
-
-	state->flags = ST_SUSPENDED;
-	pm_runtime_enable(&pdev->dev);
-
-	v4l2_info(&state->sd, "%s : csis%d probe success\n", __func__, pdev->id);
-	return 0;
-
-e_irqfree:
-	free_irq(state->irq, state);
-e_regput:
-	if (state->supply)
-		regulator_put(state->supply);
-e_clkput:
-	clk_disable(state->clock[CSIS_CLK_MUX]);
-	s5pcsis_clk_put(state);
-e_unmap:
-	iounmap(state->regs);
-e_reqmem:
-	release_mem_region(regs_res->start, resource_size(regs_res));
-e_free:
-	kfree(state);
 	return ret;
 }
 
-static int s5pcsis_suspend(struct device *dev)
+static int ov5645_write(struct v4l2_subdev *sd, unsigned short reg,
+		unsigned char value)
 {
-	struct s5p_platform_mipi_csis *pdata = dev->platform_data;
-	struct platform_device *pdev = to_platform_device(dev);
-	struct v4l2_subdev *sd = platform_get_drvdata(pdev);
-	struct csis_state *state = sd_to_csis_state(sd);
-	int ret = 0;
-
-	v4l2_dbg(1, debug, sd, "%s: flags: 0x%x\n",
-		 __func__, state->flags);
-
-	mutex_lock(&state->lock);
-	if (state->flags & ST_POWERED) {
-		s5pcsis_stop_stream(state);
-		ret = pdata->phy_enable(state->pdev, false);
-		if (ret)
-			goto unlock;
-		if (state->supply) {
-			ret = regulator_disable(state->supply);
-			if (ret)
-				goto unlock;
-		}
-		clk_disable(state->clock[CSIS_CLK_GATE]);
-		state->flags &= ~ST_POWERED;
-	}
-	state->flags |= ST_SUSPENDED;
- unlock:
-	mutex_unlock(&state->lock);
-	return ret ? -EAGAIN : 0;
-}
-
-static int s5pcsis_resume(struct device *dev)
-{
-	struct s5p_platform_mipi_csis *pdata = dev->platform_data;
-	struct platform_device *pdev = to_platform_device(dev);
-	struct v4l2_subdev *sd = platform_get_drvdata(pdev);
-	struct csis_state *state = sd_to_csis_state(sd);
-	int ret = 0;
-
-	v4l2_info(sd, "%s: flags: 0x%x\n", __func__, state->flags);
-
-	mutex_lock(&state->lock);
-	if (!(state->flags & ST_SUSPENDED))
-		goto unlock;
-
-	if (!(state->flags & ST_POWERED)) {
-		if (state->supply)
-			ret = regulator_enable(state->supply);
-		if (ret)
-			goto unlock;
-
-		ret = pdata->phy_enable(state->pdev, true);
-		if (!ret) {
-			state->flags |= ST_POWERED;
-		} else if (state->supply) {
-			regulator_disable(state->supply);
-			goto unlock;
-		}
-		clk_enable(state->clock[CSIS_CLK_GATE]);
-	}
-	if (state->flags & ST_STREAMING)
-		s5pcsis_start_stream(state);
-
-	state->flags &= ~ST_SUSPENDED;
- unlock:
-	mutex_unlock(&state->lock);
-	return ret ? -EAGAIN : 0;
-}
-
-#ifdef CONFIG_PM_SLEEP
-static int s5pcsis_pm_suspend(struct device *dev)
-{
-	return s5pcsis_suspend(dev);
-}
-
-static int s5pcsis_pm_resume(struct device *dev)
-{
+	struct i2c_client *client = v4l2_get_subdevdata(sd);
+	unsigned char buf[3] = {reg >> 8, reg & 0xff, value};
+	struct i2c_msg msg = {
+		.addr	= client->addr,
+		.flags	= 0,
+		.len	= 3,
+		.buf	= buf,
+	};
 	int ret;
 
-	ret = s5pcsis_resume(dev);
-
-	if (!ret) {
-		pm_runtime_disable(dev);
-		ret = pm_runtime_set_active(dev);
-		pm_runtime_enable(dev);
-	}
+	ret = i2c_transfer(client->adapter, &msg, 1);
+	if (ret > 0)
+		ret = 0;
 
 	return ret;
 }
+
+static const struct ov5645_win_size *ov5645_select_win(u32 width, u32 height)
+{
+	const struct ov5645_win_size *win;
+    int i;
+    OV5645_DBG("%s\n",__func__);
+
+    for (i = 0; i < ARRAY_SIZE(ov5645_win); i++) {
+        win = ov5645_win[i];
+        if (width == win->width && height == win->height)
+            return win;
+    }
+
+    printk(KERN_ERR "%s: unsupported width, height (%dx%d)\n", __func__, width, height);
+    return NULL;
+}
+
+static int ov5645_set_mbusformat(struct i2c_client *client, const struct ov5645_color_format *cfmt)
+{
+
+    enum v4l2_mbus_pixelcode code;
+    int ret = -1;
+
+    OV5645_DBG("%s\n",__func__);
+
+    code = cfmt->code;
+    switch (code) {
+        case V4L2_MBUS_FMT_YUYV8_2X8:
+            ret  = reg_write_array(client, ov5645_fmt_yuv422_yuyv);
+            break;
+        case V4L2_MBUS_FMT_UYVY8_2X8:
+            ret  = reg_write_array(client, ov5645_fmt_yuv422_uyvy);
+            break;
+        case V4L2_MBUS_FMT_YVYU8_2X8:
+            ret  = reg_write_array(client, ov5645_fmt_yuv422_yvyu);
+            break;
+        case V4L2_MBUS_FMT_VYUY8_2X8:
+            ret  = reg_write_array(client, ov5645_fmt_yuv422_vyuy);
+            break;
+        default:
+            printk(KERN_ERR "mbus code error in %s() line %d\n",__FUNCTION__, __LINE__);
+    }
+    return ret;
+}
+
+static int ov5645_set_params(struct v4l2_subdev *sd, u32 *width, u32 *height, enum v4l2_mbus_pixelcode code)
+{
+    struct ov5645_priv *priv = to_priv(sd);
+    const struct ov5645_win_size *old_win, *new_win;
+    int i;
+    OV5645_DBG("%s\n",__func__);
+
+    /*
+     * select format
+     */
+    priv->cfmt = NULL;
+    for (i = 0; i < ARRAY_SIZE(ov5645_cfmts); i++) {
+        if (code == ov5645_cfmts[i].code) {
+            priv->cfmt = ov5645_cfmts + i;
+            break;
+        }
+    }
+    if (!priv->cfmt) {
+        printk(KERN_ERR "Unsupported sensor format.\n");
+        return -EINVAL;
+    }
+
+    /*
+     * select win
+     */
+    old_win = priv->win;
+    new_win = ov5645_select_win(*width, *height);
+    if (!new_win) {
+        printk(KERN_ERR "Unsupported win size\n");
+        return -EINVAL;
+    }
+    priv->win = new_win;
+
+    priv->rect.left = 0;
+    priv->rect.top = 0;
+    priv->rect.width = priv->win->width;
+    priv->rect.height = priv->win->height;
+
+    *width = priv->win->width;
+    *height = priv->win->height;
+
+    return 0;
+}
+
+/****************************************************************************************
+ * control functions
+ */
+static int ov5645_set_brightness(struct v4l2_subdev *sd, struct v4l2_ctrl *ctrl)
+{
+    struct i2c_client *client = v4l2_get_subdevdata(sd);
+    //struct ov5645_priv *priv = to_priv(sd);
+    int value = ctrl->val;
+    int ret = 0;
+    OV5645_DBG("%s: val %d\n", __func__, ctrl->val);
+
+    switch(value){
+		case -3:
+			ret=reg_write_array(client, OV5645_reg_exposure_n3);
+			break;
+		case -2:
+			ret=reg_write_array(client, OV5645_reg_exposure_n2);
+			break;
+		case -1:
+			ret=reg_write_array(client, OV5645_reg_exposure_n1);
+			break;
+		case 0:
+			ret=reg_write_array(client, OV5645_reg_exposure_0);
+			break;
+		case 1:
+			ret=reg_write_array(client, OV5645_reg_exposure_1);
+			break;
+		case 2:
+			ret=reg_write_array(client, OV5645_reg_exposure_2);
+			break;
+		case 3:
+			ret=reg_write_array(client, OV5645_reg_exposure_3);
+			break;
+		default:
+			//OV5645_DBG("%s:default \n",__func__);
+			ret = -EINVAL	;
+	}
+
+    return 0;
+}
+
+static int ov5645_set_contrast(struct v4l2_subdev *sd, struct v4l2_ctrl *ctrl)
+{
+    /* TODO */
+    int contrast = ctrl->val;
+    OV5645_DBG("%s: val %d\n", __func__, contrast);
+
+    return 0;
+}
+
+static int ov5645_set_auto_white_balance(struct v4l2_subdev *sd, struct v4l2_ctrl *ctrl)
+{
+    struct i2c_client *client = v4l2_get_subdevdata(sd);
+    /* struct ov5645_priv *priv = to_priv(sd); */
+    int auto_white_balance = ctrl->val;
+    int ret;
+    u8 awb;
+
+    OV5645_DBG("%s: val %d\n", __func__, auto_white_balance);
+    if (auto_white_balance < 0 || auto_white_balance > 1) {
+        dev_err(&client->dev, "set auto_white_balance over range, auto_white_balance = %d\n", auto_white_balance);
+        return -ERANGE;
+    }
+
+    reg_read_16(client, 0x3406, &awb);
+    switch(auto_white_balance) {
+        case 0:
+            OV5645_ERR("===awb disable===\n");
+            ret = reg_write_16(client, 0x3406, awb&0xfe);
+            break;
+        case 1:
+            OV5645_ERR("===awb enable===\n");
+            ret = reg_write_16(client, 0x3406, awb|0x01);
+            break;
+    }
+
+    return 0;
+}
+
+/* TODO : exposure */
+static int ov5645_set_exposure(struct v4l2_subdev *sd, struct v4l2_ctrl *ctrl)
+{
+    OV5645_DBG("%s: val %d\n", __func__, ctrl->val);
+    return 0;
+}
+
+/* TODO */
+static int ov5645_set_gain(struct v4l2_subdev *sd, struct v4l2_ctrl *ctrl)
+{
+    /* struct i2c_client *client = v4l2_get_subdevdata(sd); */
+    /* struct ov5645_priv *priv = to_priv(sd); */
+    OV5645_DBG("%s: val %d\n", __func__, ctrl->val);
+    return 0;
+}
+
+/* TODO */
+static int ov5645_set_hflip(struct v4l2_subdev *sd, struct v4l2_ctrl *ctrl)
+{
+    /* struct i2c_client *client = v4l2_get_subdevdata(sd); */
+    /* struct ov5645_priv *priv = to_priv(sd); */
+    OV5645_DBG("%s: val %d\n", __func__, ctrl->val);
+    return 0;
+}
+
+static int ov5645_set_white_balance_temperature(struct v4l2_subdev *sd, struct v4l2_ctrl *ctrl)
+{
+    struct i2c_client *client = v4l2_get_subdevdata(sd);
+    /* struct ov5645_priv *priv = to_priv(sd); */
+    int white_balance_temperature = ctrl->val;
+    int ret;
+
+    OV5645_DBG("%s: val %d\n", __func__, ctrl->val);
+
+    switch(white_balance_temperature) {
+        case V4L2_WHITE_BALANCE_FLUORESCENT:
+            ret = reg_write_array(client, OV5645_reg_wb_fluorscent);
+            break;
+        case V4L2_WHITE_BALANCE_SUNNY:
+            ret = reg_write_array(client, OV5645_reg_wb_sunny);
+            break;
+        case V4L2_WHITE_BALANCE_CLOUDY_DAYLIGHT:
+            ret = reg_write_array(client, OV5645_reg_wb_cloudy);
+            break;
+        case V4L2_WHITE_BALANCE_TUNGSTEN:
+            ret = reg_write_array(client, OV5645_reg_wb_tungsten);
+            break;
+        default:
+            dev_err(&client->dev, "set white_balance_temperature over range, white_balance_temperature = %d\n", white_balance_temperature);
+            return -ERANGE;
+    }
+
+    return 0;
+}
+
+static int ov5645_set_colorfx(struct v4l2_subdev *sd, struct v4l2_ctrl *ctrl)
+{
+    struct i2c_client *client = v4l2_get_subdevdata(sd);
+    /* struct ov5645_priv *priv = to_priv(sd); */
+    int colorfx = ctrl->val;
+    int ret;
+
+    OV5645_DBG("%s: val %d\n", __func__, ctrl->val);
+
+    switch (colorfx) {
+        case V4L2_COLORFX_NONE: /* normal */
+            ret = reg_write_array(client, ov5645_colorfx_none_regs);
+            break;
+        case V4L2_COLORFX_BW: /* black and white */
+            ret = reg_write_array(client, ov5645_colorfx_bw_regs);
+            break;
+        case V4L2_COLORFX_SEPIA: /* antique ,žŽ¹Å*/
+            ret = reg_write_array(client, ov5645_colorfx_sepia_regs);
+            break;
+        case V4L2_COLORFX_NEGATIVE: /* negative£¬žºÆ¬ */
+            ret = reg_write_array(client, ov5645_colorfx_negative_regs);
+            break;
+        default:
+            dev_err(&client->dev, "set colorfx over range, colorfx = %d\n", colorfx);
+            return -ERANGE;
+    }
+
+    return 0;
+}
+
+static int ov5645_set_exposure_auto(struct v4l2_subdev *sd, struct v4l2_ctrl *ctrl)
+{
+    struct i2c_client *client = v4l2_get_subdevdata(sd);
+    int exposure_auto = ctrl->val;
+
+    /* unsigned int reg_0xec; */
+    /* int ret; */
+
+	OV5645_DBG("%s:set auto focus,value=%d \n",__func__,exposure_auto);
+
+	if(exposure_auto == 0){               //ace 20150729 add test for auot focus
+		OV5645_DBG("set auto focus cancel \n");
+		//state->focus_mode = -1;
+		//reg_write_array(client, OV5645_focus_cancel);
+reg_write_array(client, OV5645_focus_constant);	//not work;
+	}else{
+		OV5645_DBG("start to single focus \n");
+		//state->focus_mode = FOCUS_MODE_AUTO;
+		//reg_write_array(client, OV5645_focus_single);
+
+//reg_write_array(client, OV5645_focus_constant);
+
+#if 0
+//if(!priv->autofocused)
+{
+	priv->autofocused = true;
+	//reg_write_array(client, OV5645_focus_constant);
+	printk("hdc auto focus constant\n");
+}
+#endif 
+
+#if 0
+		while(1)
+		{
+			ov5645_read(sd,0x3029,&temval);
+			if(temval=0x10)
+				break;
+			mdelay(10);
+		}
+		mdelay(10);
+#endif
+	}
+
+    if (exposure_auto < 0 || exposure_auto > 1) {
+        dev_err(&client->dev, "set exposure_auto over range, exposure_auto = %d\n", exposure_auto);
+        return -ERANGE;
+    }
+
+    return 0;
+}
+
+/* TODO */
+static int ov5645_set_scene_exposure(struct v4l2_subdev *sd, struct v4l2_ctrl *ctrl)
+{
+    OV5645_DBG("%s: val %d\n", __func__, ctrl->val);
+    return 0;
+}
+
+static int ov5645_set_prev_capt_mode(struct v4l2_subdev *sd, struct v4l2_ctrl *ctrl)
+{
+    struct i2c_client *client = v4l2_get_subdevdata(sd);
+    struct ov5645_priv *priv = to_priv(sd);
+    OV5645_DBG("%s: val %d\n", __func__, ctrl->val);
+
+    switch(ctrl->val) {
+        case PREVIEW_MODE:
+            priv->prev_capt_mode = ctrl->val;
+            break;
+        case CAPTURE_MODE:
+            priv->prev_capt_mode = ctrl->val;
+            break;
+        default:
+            dev_err(&client->dev, "set_prev_capt_mode over range, prev_capt_mode = %d\n", ctrl->val);
+            return -ERANGE;
+    }
+
+    return 0;
+}
+
+static int ov5645_s_ctrl(struct v4l2_ctrl *ctrl)
+{
+    struct v4l2_subdev *sd = ctrl_to_sd(ctrl);
+    struct i2c_client *client = v4l2_get_subdevdata(sd);
+    int ret = 0;
+    OV5645_DBG("%s.............%x...........\n",__func__,ctrl->id);
+
+    switch (ctrl->id) {
+        case V4L2_CID_BRIGHTNESS:
+            ov5645_set_brightness(sd, ctrl);
+            break;
+
+        case V4L2_CID_CONTRAST:
+            ov5645_set_contrast(sd, ctrl);
+            break;
+
+        case V4L2_CID_AUTO_WHITE_BALANCE:
+            ov5645_set_auto_white_balance(sd, ctrl);
+            break;
+
+        case V4L2_CID_EXPOSURE:
+            ov5645_set_exposure(sd, ctrl);
+            break;
+
+        case V4L2_CID_GAIN:
+            ov5645_set_gain(sd, ctrl);
+            break;
+
+        case V4L2_CID_HFLIP:
+            ov5645_set_hflip(sd, ctrl);
+            break;
+
+        case V4L2_CID_WHITE_BALANCE_TEMPERATURE:
+            ov5645_set_white_balance_temperature(sd, ctrl);
+            break;
+
+        case V4L2_CID_COLORFX:
+            ov5645_set_colorfx(sd, ctrl);
+            break;
+
+        case V4L2_CID_EXPOSURE_AUTO:
+            ov5645_set_exposure_auto(sd, ctrl);
+            break;
+
+        case V4L2_CID_SCENE_EXPOSURE:
+            ov5645_set_scene_exposure(sd, ctrl);
+            break;
+
+        case V4L2_CID_PRIVATE_PREV_CAPT:
+            ov5645_set_prev_capt_mode(sd, ctrl);
+            break;
+
+        default:
+            dev_err(&client->dev, "%s: invalid control id %d\n", __func__, ctrl->id);
+            return -EINVAL;
+    }
+
+    return ret;
+}
+
+static const struct v4l2_ctrl_ops ov5645_ctrl_ops = {
+    .s_ctrl = ov5645_s_ctrl,
+};
+
+static const struct v4l2_ctrl_config ov5645_custom_ctrls[] = {
+    {
+        .ops    = &ov5645_ctrl_ops,
+        .id     = V4L2_CID_SCENE_EXPOSURE,
+        .type   = V4L2_CTRL_TYPE_INTEGER,
+        .name   = "SceneExposure",
+        .min    = 0,
+        .max    = 1,
+        .def    = 0,
+        .step   = 1,
+    }, {
+        .ops    = &ov5645_ctrl_ops,
+        .id     = V4L2_CID_PRIVATE_PREV_CAPT,
+        .type   = V4L2_CTRL_TYPE_INTEGER,
+        .name   = "PrevCapt",
+        .min    = 0,
+        .max    = 1,
+        .def    = 0,
+        .step   = 1,
+    }
+};
+
+static int ov5645_initialize_ctrls(struct ov5645_priv *priv)
+{
+    OV5645_DBG("%s\n",__func__);
+
+    v4l2_ctrl_handler_init(&priv->hdl, NUM_CTRLS);
+
+    /* standard ctrls */
+    priv->brightness = v4l2_ctrl_new_std(&priv->hdl, &ov5645_ctrl_ops,
+            V4L2_CID_BRIGHTNESS, 0, 6, 1, 0);
+    if (!priv->brightness) {
+        printk(KERN_ERR "%s: failed to create brightness ctrl\n", __func__);
+        return -ENOENT;
+    }
+
+    priv->contrast = v4l2_ctrl_new_std(&priv->hdl, &ov5645_ctrl_ops,
+            V4L2_CID_CONTRAST, -6, 6, 1, 0);
+    if (!priv->contrast) {
+        printk(KERN_ERR "%s: failed to create contrast ctrl\n", __func__);
+        return -ENOENT;
+    }
+
+    priv->auto_white_balance = v4l2_ctrl_new_std(&priv->hdl, &ov5645_ctrl_ops,
+            V4L2_CID_AUTO_WHITE_BALANCE, 0, 1, 1, 1);
+    if (!priv->auto_white_balance) {
+        printk(KERN_ERR "%s: failed to create auto_white_balance ctrl\n", __func__);
+        return -ENOENT;
+    }
+
+#if 0
+    priv->exposure = v4l2_ctrl_new_std(&priv->hdl, &ov5645_ctrl_ops,
+            V4L2_CID_EXPOSURE, 0, 0xFFFF, 1, 500);
+    if (!priv->exposure) {
+        printk(KERN_ERR "%s: failed to create exposure ctrl\n", __func__);
+        return -ENOENT;
+    }
 #endif
 
-static int __devexit s5pcsis_remove(struct platform_device *pdev)
+    priv->gain = v4l2_ctrl_new_std(&priv->hdl, &ov5645_ctrl_ops,
+            V4L2_CID_GAIN, 0, 0xFF, 1, 128);
+    if (!priv->gain) {
+        printk(KERN_ERR "%s: failed to create gain ctrl\n", __func__);
+        return -ENOENT;
+    }
+
+    priv->hflip = v4l2_ctrl_new_std(&priv->hdl, &ov5645_ctrl_ops,
+            V4L2_CID_HFLIP, 0, 1, 1, 0);
+    if (!priv->hflip) {
+        printk(KERN_ERR "%s: failed to create hflip ctrl\n", __func__);
+        return -ENOENT;
+    }
+
+    priv->white_balance_temperature = v4l2_ctrl_new_std(&priv->hdl, &ov5645_ctrl_ops,
+            V4L2_CID_WHITE_BALANCE_TEMPERATURE, 0, 3, 1, 1);
+    if (!priv->white_balance_temperature) {
+        printk(KERN_ERR "%s: failed to create white_balance_temperature ctrl\n", __func__);
+        return -ENOENT;
+    }
+
+    /* standard menus */
+    priv->colorfx = v4l2_ctrl_new_std_menu(&priv->hdl, &ov5645_ctrl_ops,
+            V4L2_CID_COLORFX, 3, 0, 0);
+    if (!priv->colorfx) {
+        printk(KERN_ERR "%s: failed to create colorfx ctrl\n", __func__);
+        return -ENOENT;
+    }
+
+    priv->exposure_auto = v4l2_ctrl_new_std_menu(&priv->hdl, &ov5645_ctrl_ops,
+            V4L2_CID_EXPOSURE_AUTO, 1, 0, 1);
+    if (!priv->exposure_auto) {
+        printk(KERN_ERR "%s: failed to create exposure_auto ctrl\n", __func__);
+        return -ENOENT;
+    }
+
+    /* custom ctrls */
+    priv->scene_exposure = v4l2_ctrl_new_custom(&priv->hdl, &ov5645_custom_ctrls[0], NULL);
+    if (!priv->scene_exposure) {
+        printk(KERN_ERR "%s: failed to create scene_exposure ctrl\n", __func__);
+        return -ENOENT;
+    }
+
+    priv->prev_capt = v4l2_ctrl_new_custom(&priv->hdl, &ov5645_custom_ctrls[1], NULL);
+    if (!priv->prev_capt) {
+        printk(KERN_ERR "%s: failed to create prev_capt ctrl\n", __func__);
+        return -ENOENT;
+    }
+
+    priv->subdev.ctrl_handler = &priv->hdl;
+    if (priv->hdl.error) {
+        printk(KERN_ERR "%s: ctrl handler error(%d)\n", __func__, priv->hdl.error);
+        v4l2_ctrl_handler_free(&priv->hdl);
+        return -EINVAL;
+    }
+
+    return 0;
+}
+
+static int ov5645_save_exposure_param(struct v4l2_subdev *sd)
 {
-	struct v4l2_subdev *sd = platform_get_drvdata(pdev);
-	struct csis_state *state = sd_to_csis_state(sd);
-	struct resource *res = state->regs_res;
+    //struct i2c_client *client = v4l2_get_subdevdata(sd);
+    //struct ov5645_priv *priv = to_priv(sd);
+    int ret = 0;
+  /*  unsigned int reg_0x03 = 0x20;
+    unsigned int reg_0x80;
+    unsigned int reg_0x81;
+    unsigned int reg_0x82;
 
-	pm_runtime_disable(&pdev->dev);
-	s5pcsis_suspend(&pdev->dev);
-	clk_disable(state->clock[CSIS_CLK_MUX]);
-	pm_runtime_set_suspended(&pdev->dev);
+    i2c_smbus_write_byte_data(client, 0x03, reg_0x03); //page 20
+    reg_0x80 = i2c_smbus_read_byte_data(client, 0x80);
+    reg_0x81 = i2c_smbus_read_byte_data(client, 0x81);
+    reg_0x82 = i2c_smbus_read_byte_data(client, 0x82);
 
-	s5pcsis_clk_put(state);
-	if (state->supply)
-		regulator_put(state->supply);
+    priv->preview_exposure_param.shutter = (reg_0x80 << 16)|(reg_0x81 << 8)|reg_0x82;
+    priv->capture_exposure_param.shutter = (priv->preview_exposure_param.shutter)/2;
+*/
+    return ret;
+}
 
-	media_entity_cleanup(&state->sd.entity);
-	free_irq(state->irq, state);
-	iounmap(state->regs);
-	release_mem_region(res->start, resource_size(res));
-	kfree(state);
+static int ov5645_set_exposure_param(struct v4l2_subdev *sd) __attribute__((unused));
+static int ov5645_set_exposure_param(struct v4l2_subdev *sd)
+{
+    //struct i2c_client *client = v4l2_get_subdevdata(sd);
+    //struct ov5645_priv *priv = to_priv(sd);
+    //int ret;
+ /*   unsigned int reg_0x03 = 0x20;
+    unsigned int reg_0x83;
+    unsigned int reg_0x84;
+    unsigned int reg_0x85;
+
+    if(priv->capture_exposure_param.shutter < 1)
+        priv->capture_exposure_param.shutter = 1;
+
+    reg_0x83 = (priv->capture_exposure_param.shutter)>>16;
+    reg_0x84 = ((priv->capture_exposure_param.shutter)>>8) & 0x000000FF;
+    reg_0x85 = (priv->capture_exposure_param.shutter) & 0x000000FF;
+
+    ret = i2c_smbus_write_byte_data(client, 0x03, reg_0x03); //page 20
+    ret |= i2c_smbus_write_byte_data(client, 0x83, reg_0x83);
+    ret |= i2c_smbus_write_byte_data(client, 0x84, reg_0x84);
+    ret |= i2c_smbus_write_byte_data(client, 0x85, reg_0x85);
+*/
+    return 0;
+}
+
+/****************************************************************************************
+ * v4l2 subdev ops
+ */
+
+/**
+ * core ops
+ */
+static int ov5645_g_chip_ident(struct v4l2_subdev *sd, struct v4l2_dbg_chip_ident *id)
+{
+
+    struct ov5645_priv *priv = to_priv(sd);
+    OV5645_DBG("%s\n",__func__);
+
+    id->ident    = priv->model;
+    id->revision = 0;
+    return 0;
+}
+
+static int ov5645_s_power(struct v4l2_subdev *sd, int on)
+{
+    /* used when suspending */
+    OV5645_DBG("%s: on %d\n", __func__, on);
+    if (!on) {
+        struct ov5645_priv *priv = to_priv(sd);
+        priv->initialized = false;
+	    priv->autofocused = false;	//hdc 20151123
+    } 
+
+    return 0;
+}
+
+static const struct v4l2_subdev_core_ops ov5645_subdev_core_ops = {
+    .g_chip_ident	= ov5645_g_chip_ident,
+    .s_power        = ov5645_s_power,
+    .s_ctrl         = v4l2_subdev_s_ctrl,
+};
+
+static int reg_wait_stat(struct i2c_client *client, u16 reg, u8 mask, u8 stat)
+{
+    int retry = 20;
+    u8 val = 0;
+    int ret;
+
+    do {
+        ret = reg_read_16(client, reg, &val);
+        if (ret < 0)
+            return ret;
+        OV5645_DBG("%s status %x\n", __func__, val);
+        if ((val & mask) == stat)
+            break;
+
+        msleep(50);
+
+    } while (--retry);
+
+    if (!retry)
+        return -ETIMEDOUT;
+
+    return 0;
+}
+
+static int reg_txdata(struct i2c_client *client, u8 *data, int length)
+{
+    struct i2c_msg msg[] = {
+        {
+            .addr   = client->addr,
+            .flags  = 0,
+            .len    = length,
+            .buf    = data,
+        },
+    };
+
+    if (i2c_transfer(client->adapter, msg, 1) < 0) {
+        dev_err(&client->dev, "%s: i2c transfer data (%d bytes) error\n",
+                __func__, length);
+        return -EIO;
+    }
+
+    return 0;
+}
+
+
+static struct i2c_client *gclient;
+static void ov5640_auto_focus(struct work_struct *work)
+{
+    reg_write_array(gclient, OV5645_auto_focus_init_s1);
+
+    msleep(20);
+
+    reg_txdata(gclient, OV5645_auto_focus_init_s2, ARRAY_SIZE(OV5645_auto_focus_init_s2));
+    msleep(100);
+
+    reg_write_array(gclient, OV5645_auto_focus_init_s3);
+
+    reg_wait_stat(gclient, 0x3029, 0xff, 0x70);
+
+    reg_write_array(gclient, OV5645_focus_constant);
+}
+
+
+
+
+static int ov5645_init(struct v4l2_subdev *sd)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(sd);
+    gclient = client;
+	OV5645_DBG("enter %s\n",__func__);
+
+	reg_write_array(client, ov5645_reset_regs);
+	usleep_range(5000, 5500);  // must
+    
+    reg_write_array(client, OV5645_reg_init_2lane);
+    
+    msleep(20);
+    
+    return 0;
+}
+
+
+/**
+ * video ops
+ */
+static int ov5645_s_stream(struct v4l2_subdev *sd, int enable)
+{
+    struct i2c_client *client = v4l2_get_subdevdata(sd);
+    struct ov5645_priv *priv = to_priv(sd);
+    int ret = 0;
+	
+    OV5645_DBG("%s: enable %d, initialized %d\n", __func__, enable, priv->initialized);
+    
+    if (enable) {
+        if (!priv->win || !priv->cfmt) {
+            dev_err(&client->dev, "norm or win select error\n");
+            return -EPERM;
+        }
+        /* write init regs */
+        if (!priv->initialized) {
+
+            ov5645_video_probe(client);
+
+            ret = ov5645_init(sd);
+            if (ret < 0) {
+                printk(KERN_ERR "%s: failed to reg_write_array init regs\n", __func__);
+                return -EIO;
+            }
+            priv->initialized = true;
+            OV5645_DBG("%s reg_write_array init regs\n", __func__);
+        } 
+        reg_write_array(client, OV5645_reg_stop_stream);
+        ret = reg_write_array(client, (struct regval_list *)priv->win->win_regs);
+        if (ret < 0) {
+            printk(KERN_ERR "%s: failed to reg_write_array win regs\n", __func__);
+            return -EIO;
+        }
+        OV5645_DBG("%s: reg_write_array win regs\n", __func__);
+
+        ret = ov5645_set_mbusformat(client, priv->cfmt);
+        if (ret < 0) {
+            printk(KERN_ERR "%s: failed to ov5645_set_mbusformat()\n", __func__);
+            return -EIO;
+        }
+
+        reg_write_array(client, OV5645_reg_start_stream);
+    
+	schedule_delayed_work(&focus_work, msecs_to_jiffies(3000));
+    } else {
+        //reg_write_array(client, OV5645_reg_stop_stream);
+	    OV5645_DBG("%s: OV5645_reg_stop_stream\n", __func__);
+    }
+
+    return ret;
+}
+
+static int ov5645_enum_framesizes(struct v4l2_subdev *sd, struct v4l2_frmsizeenum *fsize)
+{
+    struct i2c_client *client = v4l2_get_subdevdata(sd);
+
+    if (fsize->index >= ARRAY_SIZE(ov5645_win)) {
+        dev_err(&client->dev, "index(%d) is over range %d\n", fsize->index, ARRAY_SIZE(ov5645_win));
+        return -EINVAL;
+    }
+
+    switch (fsize->pixel_format) {
+        case V4L2_PIX_FMT_YUV420:
+        case V4L2_PIX_FMT_YUV422P:
+        case V4L2_PIX_FMT_NV12:
+        case V4L2_PIX_FMT_YUYV:
+            fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+            fsize->discrete.width = ov5645_win[fsize->index]->width;
+            fsize->discrete.height = ov5645_win[fsize->index]->height;
+            break;
+        default:
+            dev_err(&client->dev, "pixel_format(%d) is Unsupported\n", fsize->pixel_format);
+            return -EINVAL;
+    }
+
+    dev_info(&client->dev, "type %d, width %d, height %d\n", V4L2_FRMSIZE_TYPE_DISCRETE, fsize->discrete.width, fsize->discrete.height);
+    return 0;
+}
+
+static int ov5645_enum_mbus_fmt(struct v4l2_subdev *sd, unsigned int index,
+        enum v4l2_mbus_pixelcode *code)
+{
+    if (index >= ARRAY_SIZE(ov5645_cfmts))
+        return -EINVAL;
+    OV5645_DBG("%s\n",__func__);
+
+    *code = ov5645_cfmts[index].code;
+    return 0;
+}
+
+static int ov5645_g_mbus_fmt(struct v4l2_subdev *sd, struct v4l2_mbus_framefmt *mf)
+{
+    struct i2c_client *client = v4l2_get_subdevdata(sd);
+    struct ov5645_priv *priv = to_priv(sd);
+    if (!priv->win || !priv->cfmt) {
+        u32 width = SVGA_WIDTH;
+        u32 height = SVGA_HEIGHT;
+        int ret = ov5645_set_params(sd, &width, &height, V4L2_MBUS_FMT_UYVY8_2X8);
+        if (ret < 0) {
+            dev_info(&client->dev, "%s, %d\n", __func__, __LINE__);
+            return ret;
+        }
+    }
+    OV5645_DBG("%s\n",__func__);
+
+    mf->width   = priv->win->width;
+    mf->height  = priv->win->height;
+    mf->code    = priv->cfmt->code;
+    mf->colorspace  = priv->cfmt->colorspace;
+    mf->field   = V4L2_FIELD_NONE;
+    dev_info(&client->dev, "%s, %d\n", __func__, __LINE__);
+    return 0;
+}
+
+static int ov5645_try_mbus_fmt(struct v4l2_subdev *sd,
+        struct v4l2_mbus_framefmt *mf)
+{
+    /* struct i2c_client *client = v4l2_get_subdevdata(sd); */
+    struct ov5645_priv *priv = to_priv(sd);
+    const struct ov5645_win_size *win;
+    int i;
+    OV5645_DBG("%s\n",__func__);
+
+    /*
+     * select suitable win
+     */
+    win = ov5645_select_win(mf->width, mf->height);
+    if (!win)
+        return -EINVAL;
+
+    mf->width   = win->width;
+    mf->height  = win->height;
+    mf->field   = V4L2_FIELD_NONE;
+
+
+    for (i = 0; i < ARRAY_SIZE(ov5645_cfmts); i++)
+        if (mf->code == ov5645_cfmts[i].code)
+            break;
+
+    if (i == ARRAY_SIZE(ov5645_cfmts)) {
+        /* Unsupported format requested. Propose either */
+        if (priv->cfmt) {
+            /* the current one or */
+            mf->colorspace = priv->cfmt->colorspace;
+            mf->code = priv->cfmt->code;
+        } else {
+            /* the default one */
+            mf->colorspace = ov5645_cfmts[0].colorspace;
+            mf->code = ov5645_cfmts[0].code;
+        }
+    } else {
+        /* Also return the colorspace */
+        mf->colorspace	= ov5645_cfmts[i].colorspace;
+    }
+
+    return 0;
+}
+
+static int ov5645_s_mbus_fmt(struct v4l2_subdev *sd, struct v4l2_mbus_framefmt *mf)
+{
+    /* struct i2c_client *client = v4l2_get_subdevdata(sd); */
+    struct ov5645_priv *priv = to_priv(sd);
+    int ret = -1;
+    OV5645_DBG("%s\n",__func__);
+
+    ret = ov5645_set_params(sd, &mf->width, &mf->height, mf->code);
+    if (!ret)
+        mf->colorspace = priv->cfmt->colorspace;
+
+    return ret;
+}
+
+static const struct v4l2_subdev_video_ops ov5645_subdev_video_ops = {
+    .s_stream               = ov5645_s_stream,
+    .enum_framesizes        = ov5645_enum_framesizes,
+    .enum_mbus_fmt          = ov5645_enum_mbus_fmt,
+    .g_mbus_fmt             = ov5645_g_mbus_fmt,
+    .try_mbus_fmt           = ov5645_try_mbus_fmt,
+    .s_mbus_fmt             = ov5645_s_mbus_fmt,
+};
+
+/**
+ * pad ops
+ */
+static int ov5645_s_fmt(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh,
+        struct v4l2_subdev_format *fmt)
+{
+    struct v4l2_mbus_framefmt *mf = &fmt->format;
+    OV5645_DBG("%s: %dx%d\n", __func__, mf->width, mf->height);
+    return ov5645_s_mbus_fmt(sd, mf);
+}
+
+static const struct v4l2_subdev_pad_ops ov5645_subdev_pad_ops = {
+    .set_fmt    = ov5645_s_fmt,
+};
+
+/**
+ * subdev ops
+ */
+static const struct v4l2_subdev_ops ov5645_subdev_ops = {
+    .core   = &ov5645_subdev_core_ops,
+    .video  = &ov5645_subdev_video_ops,
+    .pad    = &ov5645_subdev_pad_ops,
+};
+
+/**
+ * media_entity_operations
+ */
+static int ov5645_link_setup(struct media_entity *entity,
+        const struct media_pad *local,
+        const struct media_pad *remote, u32 flags)
+{
+    OV5645_DBG("%s\n", __func__);  // printk oc5645_link_setup
+	
+    printk("This is turf speaking\n");
+    return 0;
+}
+
+static const struct media_entity_operations ov5645_media_ops = {
+    .link_setup = ov5645_link_setup,
+};
+
+/****************************************************************************************
+ * initialize
+ */
+static void ov5645_priv_init(struct ov5645_priv * priv)
+{
+    priv->model = V4L2_IDENT_OV5645;
+    priv->prev_capt_mode = PREVIEW_MODE;
+    priv->timeperframe.denominator = 12;//30;
+    priv->timeperframe.numerator = 1;
+    priv->win = &OV5645_win_1280x960;
+}
+
+static int ov5645_video_probe(struct i2c_client *client)
+{
+	int ret;
+	u8 id_high, id_low;
+	u16 id;
+
+	/* Read sensor Model ID */
+	ret = reg_read_16(client, 0x300a, &id_high);
+	if (ret < 0)
+    {
+        OV5645_DBG("ov5645 read high ID error!\n");
+		return ret;
+    }
+
+	id = id_high << 8;
+
+	ret = reg_read_16(client, 0x300b, &id_low);
+	if (ret < 0)
+    {
+        OV5645_DBG("ov5645 read low ID error!\n");
+		return ret;
+    }
+
+	id |= id_low;
+
+	OV5645_DBG("OV5645 Chip ID 0x%04x detected\n", id);
+
+	if (id != 0x5645)
+		return -ENODEV;
 
 	return 0;
 }
 
-static const struct dev_pm_ops s5pcsis_pm_ops = {
-	SET_RUNTIME_PM_OPS(s5pcsis_suspend, s5pcsis_resume, NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(s5pcsis_pm_suspend, s5pcsis_pm_resume)
-};
-
-static struct platform_driver s5pcsis_driver = {
-	.probe		= s5pcsis_probe,
-	.remove		= __devexit_p(s5pcsis_remove),
-	.driver		= {
-		.name	= MODULE_NAME,
-		.owner	= THIS_MODULE,
-		.pm	= &s5pcsis_pm_ops,
-	},
-};
-
-static int __init s5pcsis_init(void)
+static int ov5645_probe(struct i2c_client *client, const struct i2c_device_id *id)
 {
-	return platform_driver_probe(&s5pcsis_driver, s5pcsis_probe);
+    struct ov5645_priv *priv;
+    struct v4l2_subdev *sd;
+    int ret;
+    priv = kzalloc(sizeof(struct ov5645_priv), GFP_KERNEL);
+    if (!priv)
+        return -ENOMEM;
+
+    OV5645_DBG("%s\n",__func__);
+    ov5645_priv_init(priv);
+
+    sd = &priv->subdev;
+    strcpy(sd->name, MODULE_NAME);
+	
+    //ov5645_video_probe(client);
+
+    /* register subdev */
+    v4l2_i2c_subdev_init(sd, client, &ov5645_subdev_ops);
+
+    sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+    priv->pad.flags = MEDIA_PAD_FL_SOURCE;
+    sd->entity.type = MEDIA_ENT_T_V4L2_SUBDEV_SENSOR;
+    sd->entity.ops  = &ov5645_media_ops;
+    if (media_entity_init(&sd->entity, 1, &priv->pad, 0)) {
+        dev_err(&client->dev, "%s: failed to media_entity_init()\n", __func__);
+        kfree(priv);
+        return -ENOENT;
+    }
+
+    ret = ov5645_initialize_ctrls(priv);
+    if (ret < 0) {
+        printk(KERN_ERR "%s: failed to initialize controls\n", __func__);
+        kfree(priv);
+        return ret;
+    }
+
+    return 0;
 }
 
-static void __exit s5pcsis_exit(void)
+static int ov5645_remove(struct i2c_client *client)
 {
-	platform_driver_unregister(&s5pcsis_driver);
+    struct v4l2_subdev *sd = i2c_get_clientdata(client);
+    v4l2_device_unregister_subdev(sd);
+    v4l2_ctrl_handler_free(sd->ctrl_handler);
+    media_entity_cleanup(&sd->entity);
+    kfree(to_priv(sd));
+    return 0;
 }
 
-module_init(s5pcsis_init);
-module_exit(s5pcsis_exit);
+static const struct i2c_device_id ov5645_id[] = {
+    { MODULE_NAME, 0 },
+    { }
+};
 
-MODULE_AUTHOR("Sylwester Nawrocki <s.nawrocki@samsung.com>");
-MODULE_DESCRIPTION("S5P/EXYNOS4 MIPI CSI receiver driver");
-MODULE_LICENSE("GPL");
+MODULE_DEVICE_TABLE(i2c, ov5645_id);
 
+static struct i2c_driver ov5645_i2c_driver = {
+    .driver = {
+        .name = MODULE_NAME,
+    },
+    .probe    = ov5645_probe,
+    .remove   = ov5645_remove,
+    .id_table = ov5645_id,
+};
+
+module_i2c_driver(ov5645_i2c_driver);
+
+MODULE_DESCRIPTION("SoC Camera driver for ov5645");
+MODULE_AUTHOR("caichsh(caichsh@artekmicro.com)");
+MODULE_LICENSE("GPL v2");
